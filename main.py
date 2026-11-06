@@ -8,7 +8,12 @@ robot through the HALSim WebSocket extension (halsim_ws_server) as a standard
 joystick, so WPILib's XboxController / CommandXboxController reads it normally.
 
     pip install websocket-client
-    python sim_gamepad_gui.py [--joystick 0] [--url ws://localhost:3300/wpilibws]
+    python sim_gamepad_gui.py [--joystick 0] [--url ws://localhost:3300/wpilibws] [--no-ds]
+
+By default this GUI also owns the driver station state (Enable + mode), so
+turn OFF the Sim GUI (halsim_gui) in the sim dialog, or the two will fight over
+the joystick/DS data. If you keep the Sim GUI, pass --no-ds and set up the
+robot state there (and leave its Joystick slot unassigned).
 """
 
 import argparse
@@ -85,8 +90,9 @@ HELD_COLOR = "#ff9800"
 class Link:
     """Background WebSocket client: reconnects forever, streams state every 20 ms."""
 
-    def __init__(self, url, joystick, get_state):
+    def __init__(self, url, joystick, get_state, send_ds):
         self.url, self.joystick, self.get_state = url, str(joystick), get_state
+        self.send_ds = send_ds
         self.connected = False
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -109,7 +115,12 @@ class Link:
 
     def _send_loop(self, ws):
         while self.connected:
-            axes, buttons, pov = self.get_state()
+            axes, buttons, pov, enabled, mode = self.get_state()
+            ds = {">new_data": True}  # joystick data is only visible after this
+            if self.send_ds:
+                ds.update(
+                    {">ds": True, ">enabled": enabled, ">estop": False, ">autonomous": mode == "auto", ">test": mode == "test"}
+                )
             try:
                 ws.send(
                     json.dumps(
@@ -120,21 +131,20 @@ class Link:
                         }
                     )
                 )
-                # Joystick data only becomes visible to robot code after this
-                ws.send(json.dumps({"type": "DriverStation", "device": "", "data": {">new_data": True}}))
+                ws.send(json.dumps({"type": "DriverStation", "device": "", "data": ds}))
             except Exception:
                 break
             time.sleep(0.02)
 
 
 class App:
-    def __init__(self, root, url, joystick):
+    def __init__(self, root, url, joystick, send_ds=True):
         self.root = root
         root.title(f"Sim Xbox Controller (joystick {joystick})")
         self.keys = {c[0]: c[5] for c in CONTROLS}
         self.held = {c[0]: set() for c in CONTROLS}  # who is holding each control
         self.sticks = {"L": (0.0, 0.0), "R": (0.0, 0.0)}
-        self.state = ([0.0] * 6, [False] * 10, -1)  # read by the network thread
+        self.state = ([0.0] * 6, [False] * 10, -1, False, "teleop")  # read by network thread
         self.items, self.knobs = {}, {}
         self.mouse_target = self.drag_stick = self.remapping = None
 
@@ -166,9 +176,19 @@ class App:
         root.bind_all("<KeyRelease>", self.key_up)
         root.bind("<FocusOut>", lambda e: e.widget is root and self.release_all())
 
+        self.enabled = tk.BooleanVar(value=False)
+        self.mode = tk.StringVar(value="teleop")
+        if send_ds:
+            bar = tk.Frame(root)
+            bar.pack(fill="x", padx=8, pady=4)
+            tk.Checkbutton(
+                bar, text="ENABLE", variable=self.enabled, fg="#c62828", font=("Arial", 10, "bold"), command=self.refresh_state
+            ).pack(side="left", padx=(0, 12))
+            for text, val in (("Teleop", "teleop"), ("Auto", "auto"), ("Test", "test")):
+                tk.Radiobutton(bar, text=text, value=val, variable=self.mode, command=self.refresh_state).pack(side="left")
         self.status = tk.Label(root, anchor="w")
         self.status.pack(fill="x", padx=8, pady=(0, 6))
-        self.link = Link(url, joystick, lambda: self.state)
+        self.link = Link(url, joystick, lambda: self.state, send_ds)
         self.url = url
         self.poll_status()
 
@@ -180,7 +200,8 @@ class App:
         axes = [lx, ly, 1.0 if h("LT") else 0.0, 1.0 if h("RT") else 0.0, rx, ry]
         buttons = [h(n) for n in BTN_ORDER]
         pov = POV_ANGLE.get((h("Right") - h("Left"), h("Up") - h("Down")), -1)
-        self.state = (axes, buttons, pov)  # single assignment: safe for the other thread
+        # single assignment: safe for the network thread
+        self.state = (axes, buttons, pov, self.enabled.get(), self.mode.get())
 
     def set_held(self, name, source, down):
         (self.held[name].add if down else self.held[name].discard)(source)
@@ -282,7 +303,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="ws://localhost:3300/wpilibws")
     ap.add_argument("--joystick", type=int, default=0, help="driver station joystick slot")
+    ap.add_argument("--no-ds", action="store_true", help="don't send enable/mode (use when the Sim GUI owns robot state)")
     args = ap.parse_args()
     root = tk.Tk()
-    App(root, args.url, args.joystick)
+    App(root, args.url, args.joystick, send_ds=not args.no_ds)
     root.mainloop()
