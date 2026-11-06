@@ -1,0 +1,288 @@
+"""
+Virtual Xbox controller for WPILib robot simulation.
+
+Shows an Xbox-style controller. Click and hold buttons (triggers go to 100%),
+drag the stick knobs, or use the keyboard. Right-click any button, then press
+a key to remap it (Esc cancels). Controller state is sent to the simulated
+robot through the HALSim WebSocket extension (halsim_ws_server) as a standard
+joystick, so WPILib's XboxController / CommandXboxController reads it normally.
+
+    pip install websocket-client
+    python sim_gamepad_gui.py [--joystick 0] [--url ws://localhost:3300/wpilibws]
+"""
+
+import argparse
+import json
+import math
+import threading
+import time
+import tkinter as tk
+
+import websocket  # pip install websocket-client
+
+# ---- WPILib XboxController layout -------------------------------------------
+# Axes:    0 LeftX, 1 LeftY, 2 LeftTrigger, 3 RightTrigger, 4 RightX, 5 RightY
+# Buttons: A, B, X, Y, LB, RB, Back, Start, L3, R3  (WPILib buttons 1-10)
+# Stick Y follows WPILib: up = -1, down = +1.
+BTN_ORDER = ["A", "B", "X", "Y", "LB", "RB", "Back", "Start", "L3", "R3"]
+
+# D-pad -> POV angle, keyed by (right - left, up - down)
+POV_ANGLE = {(0, 1): 0, (1, 1): 45, (1, 0): 90, (1, -1): 135, (0, -1): 180, (-1, -1): 225, (-1, 0): 270, (-1, 1): 315}
+
+# ---- On-screen layout --------------------------------------------------------
+# name, label, shape, bounding box, color, default key
+CONTROLS = [
+    ("LT", "LT", "rect", (105, 20, 205, 62), "#b0bec5", "1"),
+    ("RT", "RT", "rect", (435, 20, 535, 62), "#b0bec5", "3"),
+    ("LB", "LB", "rect", (95, 70, 215, 102), "#b0bec5", "q"),
+    ("RB", "RB", "rect", (425, 70, 545, 102), "#b0bec5", "e"),
+    ("Back", "Back", "rect", (266, 162, 314, 192), "#eceff1", "tab"),
+    ("Start", "Start", "rect", (326, 162, 374, 192), "#eceff1", "return"),
+    ("L3", "L3", "rect", (147, 207, 183, 233), "#eceff1", "z"),
+    ("R3", "R3", "rect", (377, 308, 413, 334), "#eceff1", "x"),
+    ("Up", "▲", "rect", (232, 226, 258, 252), "#eceff1", "up"),
+    ("Down", "▼", "rect", (232, 278, 258, 304), "#eceff1", "down"),
+    ("Left", "◀", "rect", (206, 252, 232, 278), "#eceff1", "left"),
+    ("Right", "▶", "rect", (258, 252, 284, 278), "#eceff1", "right"),
+    ("Y", "Y", "oval", (448, 111, 482, 145), "#fdd835", "i"),
+    ("X", "X", "oval", (411, 148, 445, 182), "#64b5f6", "u"),
+    ("B", "B", "oval", (485, 148, 519, 182), "#e57373", "k"),
+    ("A", "A", "oval", (448, 185, 482, 219), "#81c784", "j"),
+]
+BODY = [
+    110,
+    120,
+    320,
+    105,
+    530,
+    120,
+    595,
+    210,
+    610,
+    350,
+    565,
+    420,
+    500,
+    410,
+    455,
+    340,
+    185,
+    340,
+    140,
+    410,
+    75,
+    420,
+    30,
+    350,
+    45,
+    210,
+]
+STICK_POS = {"L": (165, 155), "R": (395, 255)}
+RANGE, KNOB = 30, 14  # knob travel (px) and knob radius (px)
+HELD_COLOR = "#ff9800"
+
+
+class Link:
+    """Background WebSocket client: reconnects forever, streams state every 20 ms."""
+
+    def __init__(self, url, joystick, get_state):
+        self.url, self.joystick, self.get_state = url, str(joystick), get_state
+        self.connected = False
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            ws = websocket.WebSocketApp(
+                self.url,
+                on_open=self._on_open,
+                on_message=lambda ws, msg: None,  # discard sim output, but keep reading
+                on_error=lambda ws, err: None,
+                on_close=lambda ws, code, msg: setattr(self, "connected", False),
+            )
+            ws.run_forever()
+            self.connected = False
+            time.sleep(1)
+
+    def _on_open(self, ws):
+        self.connected = True
+        threading.Thread(target=self._send_loop, args=(ws,), daemon=True).start()
+
+    def _send_loop(self, ws):
+        while self.connected:
+            axes, buttons, pov = self.get_state()
+            try:
+                ws.send(
+                    json.dumps(
+                        {
+                            "type": "Joystick",
+                            "device": self.joystick,
+                            "data": {">axes": axes, ">buttons": buttons, ">povs": [pov]},
+                        }
+                    )
+                )
+                # Joystick data only becomes visible to robot code after this
+                ws.send(json.dumps({"type": "DriverStation", "device": "", "data": {">new_data": True}}))
+            except Exception:
+                break
+            time.sleep(0.02)
+
+
+class App:
+    def __init__(self, root, url, joystick):
+        self.root = root
+        root.title(f"Sim Xbox Controller (joystick {joystick})")
+        self.keys = {c[0]: c[5] for c in CONTROLS}
+        self.held = {c[0]: set() for c in CONTROLS}  # who is holding each control
+        self.sticks = {"L": (0.0, 0.0), "R": (0.0, 0.0)}
+        self.state = ([0.0] * 6, [False] * 10, -1)  # read by the network thread
+        self.items, self.knobs = {}, {}
+        self.mouse_target = self.drag_stick = self.remapping = None
+
+        c = self.canvas = tk.Canvas(root, width=640, height=450, bg="white", highlightthickness=0)
+        c.pack()
+        c.create_polygon(BODY, smooth=True, fill="#cfd8dc", outline="#607d8b", width=3)
+
+        for name, label, shape, box, color, _ in CONTROLS:
+            make = c.create_rectangle if shape == "rect" else c.create_oval
+            tag = f"ctl_{name}"
+            sid = make(*box, fill=color, outline="#37474f", width=2, tags=(tag,))
+            tid = c.create_text((box[0] + box[2]) / 2, (box[1] + box[3]) / 2, font=("Arial", 8, "bold"), tags=(tag,))
+            self.items[name] = (sid, tid, color, label)
+            c.tag_bind(tag, "<ButtonPress-1>", lambda e, n=name: self.mouse_down(n))
+            c.tag_bind(tag, "<ButtonPress-3>", lambda e, n=name: self.start_remap(n))
+            self.refresh_label(name)
+
+        for side, (cx, cy) in STICK_POS.items():
+            tag = f"stick_{side}"
+            r = RANGE + KNOB
+            c.create_oval(cx - r, cy - r, cx + r, cy + r, fill="white", outline="#37474f", width=2, tags=(tag,))
+            self.knobs[side] = c.create_oval(0, 0, 0, 0, fill="#455a64", tags=(tag,))
+            self.place_knob(side)
+            c.tag_bind(tag, "<ButtonPress-1>", lambda e, s=side: self.stick_down(s, e))
+
+        c.bind("<B1-Motion>", self.mouse_move)
+        c.bind("<ButtonRelease-1>", self.mouse_up)
+        root.bind_all("<KeyPress>", self.key_down)
+        root.bind_all("<KeyRelease>", self.key_up)
+        root.bind("<FocusOut>", lambda e: e.widget is root and self.release_all())
+
+        self.status = tk.Label(root, anchor="w")
+        self.status.pack(fill="x", padx=8, pady=(0, 6))
+        self.link = Link(url, joystick, lambda: self.state)
+        self.url = url
+        self.poll_status()
+
+    # ---- state --------------------------------------------------------------
+    def refresh_state(self):
+        h = lambda n: bool(self.held[n])
+        lx, ly = self.sticks["L"]
+        rx, ry = self.sticks["R"]
+        axes = [lx, ly, 1.0 if h("LT") else 0.0, 1.0 if h("RT") else 0.0, rx, ry]
+        buttons = [h(n) for n in BTN_ORDER]
+        pov = POV_ANGLE.get((h("Right") - h("Left"), h("Up") - h("Down")), -1)
+        self.state = (axes, buttons, pov)  # single assignment: safe for the other thread
+
+    def set_held(self, name, source, down):
+        (self.held[name].add if down else self.held[name].discard)(source)
+        sid, _, color, _ = self.items[name]
+        self.canvas.itemconfig(sid, fill=HELD_COLOR if self.held[name] else color)
+        self.refresh_state()
+
+    def release_all(self):
+        for name in self.held:
+            for src in list(self.held[name]):
+                self.set_held(name, src, False)
+        self.mouse_target = None
+        if self.drag_stick:
+            self.set_stick(self.drag_stick, 0.0, 0.0)
+            self.drag_stick = None
+
+    # ---- mouse --------------------------------------------------------------
+    def mouse_down(self, name):
+        self.mouse_target = name
+        self.set_held(name, "mouse", True)
+
+    def stick_down(self, side, e):
+        self.drag_stick = side
+        self.mouse_move(e)
+
+    def mouse_move(self, e):
+        if not self.drag_stick:
+            return
+        cx, cy = STICK_POS[self.drag_stick]
+        dx, dy = e.x - cx, e.y - cy
+        d = math.hypot(dx, dy)
+        if d > RANGE:
+            dx, dy = dx * RANGE / d, dy * RANGE / d
+        self.set_stick(self.drag_stick, dx / RANGE, dy / RANGE)  # down = +Y, like WPILib
+
+    def mouse_up(self, e):
+        if self.mouse_target:
+            self.set_held(self.mouse_target, "mouse", False)
+            self.mouse_target = None
+        if self.drag_stick:
+            self.set_stick(self.drag_stick, 0.0, 0.0)
+            self.drag_stick = None
+
+    def set_stick(self, side, x, y):
+        self.sticks[side] = (x, y)
+        self.place_knob(side)
+        self.refresh_state()
+
+    def place_knob(self, side):
+        cx, cy = STICK_POS[side]
+        x, y = self.sticks[side]
+        kx, ky = cx + x * RANGE, cy + y * RANGE
+        self.canvas.coords(self.knobs[side], kx - KNOB, ky - KNOB, kx + KNOB, ky + KNOB)
+
+    # ---- keyboard -----------------------------------------------------------
+    def refresh_label(self, name):
+        _, tid, _, label = self.items[name]
+        self.canvas.itemconfig(tid, text=f"{label}\n{self.keys[name] or '-'}")
+
+    def start_remap(self, name):
+        self.remapping = name
+        self.status.config(text=f"Press a key for {name} (Esc to cancel)...")
+
+    def key_down(self, e):
+        key = e.keysym.lower()
+        if self.remapping:
+            name, self.remapping = self.remapping, None
+            if key != "escape":
+                for other, k in self.keys.items():  # keep keys unique
+                    if k == key and other != name:
+                        self.keys[other] = ""
+                        self.refresh_label(other)
+                self.keys[name] = key
+                self.refresh_label(name)
+            return
+        for name, k in self.keys.items():
+            if k == key:
+                self.set_held(name, "key", True)
+
+    def key_up(self, e):
+        key = e.keysym.lower()
+        for name, k in self.keys.items():
+            if k == key:
+                self.set_held(name, "key", False)
+
+    # ---- status line --------------------------------------------------------
+    def poll_status(self):
+        if not self.remapping:
+            if self.link.connected:
+                self.status.config(fg="#2e7d32", text=f"Connected to {self.url}")
+            else:
+                self.status.config(
+                    fg="#c62828", text=f"Waiting for sim at {self.url} ...  " "(right-click a button to remap its key)"
+                )
+        self.root.after(300, self.poll_status)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", default="ws://localhost:3300/wpilibws")
+    ap.add_argument("--joystick", type=int, default=0, help="driver station joystick slot")
+    args = ap.parse_args()
+    root = tk.Tk()
+    App(root, args.url, args.joystick)
+    root.mainloop()
