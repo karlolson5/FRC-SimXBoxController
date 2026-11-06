@@ -38,7 +38,9 @@ import websocket  # pip install websocket-client
 # Stick Y follows WPILib: up = -1, down = +1.
 BTN_ORDER = ["A", "B", "X", "Y", "LB", "RB", "Back", "Start", "L3", "R3"]
 
-# D-pad -> POV angle, keyed by (right - left, up - down)
+# POV encoding. WPILib 2027+: bitmask (up=1, right=2, down=4, left=8; diagonals OR'd,
+# 0 = centered). WPILib 2026 and earlier: angle in degrees, -1 = centered
+# (use --legacy-pov). Legacy table, keyed by (right - left, up - down):
 POV_ANGLE = {(0, 1): 0, (1, 1): 45, (1, 0): 90, (1, -1): 135, (0, -1): 180, (-1, -1): 225, (-1, 0): 270, (-1, 1): 315}
 
 # ---- On-screen layout --------------------------------------------------------
@@ -102,29 +104,37 @@ class Link:
         self.send_ds = send_ds
         self.wake = threading.Event()  # set on any input change -> send right away
         self.debug, self.rx, self.t_change = debug, 0, None
+        self.closing, self.ws = False, None
         self.connected = False
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
-        while True:
+        while not self.closing:
             ws = websocket.WebSocketApp(
                 self.url,
                 on_open=self._on_open,
                 on_message=self._on_message,  # discard sim output, but keep reading
-                on_error=lambda *_: None,
-                on_close=lambda *_: setattr(self, "connected", False),
+                on_error=lambda ws, err: None,
+                on_close=lambda ws, code, msg: setattr(self, "connected", False),
             )
             # TCP_NODELAY: without it Nagle + delayed ACK can stall small sends 200ms+
             ws.run_forever(sockopt=((socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),), skip_utf8_validation=True)
             self.connected = False
             time.sleep(1)
 
-    def _on_message(self):
+    def _on_message(self, ws, msg):
         self.rx += 1
 
     def _on_open(self, ws):
-        self.connected = True
+        self.ws, self.connected = ws, True
         threading.Thread(target=self._send_loop, args=(ws,), daemon=True).start()
+
+    def close(self):
+        self.closing, self.connected = True, False
+        try:
+            self.ws.close()
+        except Exception:
+            pass
 
     def _send_loop(self, ws):
         last_report = time.perf_counter()
@@ -161,13 +171,13 @@ class Link:
 
 
 class App:
-    def __init__(self, root, url, joystick, send_ds=True, debug=False):
-        self.root, self.debug = root, debug
+    def __init__(self, root, url, joystick, send_ds=True, debug=False, legacy_pov=False):
+        self.root, self.debug, self.legacy_pov = root, debug, legacy_pov
         root.title(f"Sim Xbox Controller (joystick {joystick})")
         self.keys = {c[0]: c[5] for c in CONTROLS}
         self.held = {c[0]: set() for c in CONTROLS}  # who is holding each control
         self.sticks = {"L": (0.0, 0.0), "R": (0.0, 0.0)}
-        self.state = ([0.0] * 6, [False] * 10, -1, False, "teleop")  # read by network thread
+        self.state = ([0.0] * 6, [False] * 10, -1 if legacy_pov else 0, False, "teleop")  # read by network thread
         self.items, self.knobs = {}, {}
         self.url = url
         self.link = Link(url, joystick, lambda: self.state, send_ds, debug)
@@ -200,29 +210,36 @@ class App:
         c.bind("<ButtonRelease-1>", self.mouse_up)
         root.bind_all("<KeyPress>", self.key_down)
         root.bind_all("<KeyRelease>", self.key_up)
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind("<FocusOut>", lambda e: e.widget is root and self.release_all())
 
         self.enabled = tk.BooleanVar(value=False)
         self.mode = tk.StringVar(value="teleop")
         if send_ds:
-            strip = tk.Frame(root)
-            strip.pack(fill="x", padx=8, pady=4)
+            bar = tk.Frame(root)
+            bar.pack(fill="x", padx=8, pady=4)
             tk.Checkbutton(
-                strip,
-                text="ENABLE",
-                variable=self.enabled,
-                fg="#c62828",
-                font=("Arial", 10, "bold"),
-                command=self.refresh_state,
+                bar, text="ENABLE", variable=self.enabled, fg="#c62828", font=("Arial", 10, "bold"), command=self.refresh_state
             ).pack(side="left", padx=(0, 12))
             for text, val in (("Teleop", "teleop"), ("Auto", "auto"), ("Test", "test")):
-                tk.Radiobutton(strip, text=text, value=val, variable=self.mode, command=self.refresh_state).pack(side="left")
+                tk.Radiobutton(bar, text=text, value=val, variable=self.mode, command=self.refresh_state).pack(side="left")
         self.status = tk.Label(root, anchor="w")
         self.status.pack(fill="x", padx=8, pady=(0, 6))
         self.poll_status()
         if debug:
             print("Tk", root.tk.call("info", "patchlevel"), "| Python", sys.version.split()[0])
             self.lag_check(time.perf_counter() + 0.02)
+
+    def on_close(self):
+        # leave the sim disabled with neutral inputs instead of frozen mid-press
+        self.release_all()
+        self.enabled.set(False)
+        self.refresh_state()
+        self.root.after(150, self.finish_close)  # give the sender a moment to flush
+
+    def finish_close(self):
+        self.link.close()
+        self.root.destroy()
 
     def lag_check(self, expected):
         late = (time.perf_counter() - expected) * 1000
@@ -232,14 +249,16 @@ class App:
 
     # ---- state --------------------------------------------------------------
     def refresh_state(self):
-        def h(n):
-            return bool(self.held[n])
-
+        h = lambda n: bool(self.held[n])
         lx, ly = self.sticks["L"]
         rx, ry = self.sticks["R"]
         axes = [lx, ly, 1.0 if h("LT") else 0.0, 1.0 if h("RT") else 0.0, rx, ry]
         buttons = [h(n) for n in BTN_ORDER]
-        pov = POV_ANGLE.get((h("Right") - h("Left"), h("Up") - h("Down")), -1)
+        x, y = h("Right") - h("Left"), h("Up") - h("Down")
+        if self.legacy_pov:
+            pov = POV_ANGLE.get((x, y), -1)
+        else:
+            pov = (1 if y > 0 else 4 if y < 0 else 0) | (2 if x > 0 else 8 if x < 0 else 0)
         # single assignment: safe for the network thread
         self.state = (axes, buttons, pov, self.enabled.get(), self.mode.get())
         if self.link.t_change is None:
@@ -284,7 +303,7 @@ class App:
             dx, dy = dx * RANGE / d, dy * RANGE / d
         self.set_stick(self.drag_stick, dx / RANGE, dy / RANGE)  # down = +Y, like WPILib
 
-    def mouse_up(self):
+    def mouse_up(self, e):
         if self.mouse_target:
             self.set_held(self.mouse_target, "mouse", False)
             self.mouse_target = None
@@ -351,8 +370,11 @@ if __name__ == "__main__":
     ap.add_argument("--url", default="ws://localhost:3300/wpilibws")
     ap.add_argument("--joystick", type=int, default=0, help="driver station joystick slot")
     ap.add_argument("--no-ds", action="store_true", help="don't send enable/mode (use when the Sim GUI owns robot state)")
+    ap.add_argument(
+        "--legacy-pov", action="store_true", help="send POV as angle/-1 (WPILib 2026 and earlier); default is the 2027 bitmask"
+    )
     ap.add_argument("--debug", action="store_true", help="print input->socket latency and sim message rate")
     args = ap.parse_args()
     root = tk.Tk()
-    App(root, args.url, args.joystick, send_ds=not args.no_ds, debug=args.debug)
+    App(root, args.url, args.joystick, send_ds=not args.no_ds, debug=args.debug, legacy_pov=args.legacy_pov)
     root.mainloop()
