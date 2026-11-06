@@ -1,0 +1,83 @@
+name: Build and Attach Release Executables
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:   # lets you test the build from the Actions tab without a release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: SimXboxController-Windows.exe
+          - os: macos-latest
+            asset: SimXboxController-Mac.zip
+          - os: ubuntu-latest
+            asset: SimXboxController-Linux.tar.gz
+
+    steps:
+    - name: Checkout Repository Code
+      uses: actions/checkout@v4
+
+    - name: Set up Python Runtime
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+
+    - name: Install Tk (Linux)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y python3-tk
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    # Tk 8.6.12 has a macOS bug where clicks are ignored unless the mouse is moving.
+    # Whatever Tk this Python has is what gets bundled, so fail loudly if it's too old.
+    - name: Check Tk version
+      shell: bash
+      run: |
+        python - <<'EOF'
+        import tkinter
+        v = tkinter.Tcl().eval("info patchlevel")
+        print("Tk", v)
+        assert tuple(int(x) for x in v.split(".")[:3]) >= (8, 6, 13), f"Tk {v} is too old (need >= 8.6.13)"
+        EOF
+
+    - name: Build Standalone Application
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          pyinstaller --onefile --windowed --name SimXboxController main.py
+          mv dist/SimXboxController.exe "dist/${{ matrix.asset }}"
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          pyinstaller --onedir --windowed --name SimXboxController main.py
+          ditto -c -k --keepParent dist/SimXboxController.app "dist/${{ matrix.asset }}"
+        else
+          pyinstaller --onefile --name SimXboxController main.py
+          tar -czf "dist/${{ matrix.asset }}" -C dist SimXboxController
+        fi
+
+    - name: Keep build as a workflow artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.asset }}
+        path: dist/${{ matrix.asset }}
+
+    - name: Upload Asset to GitHub Release
+      if: github.event_name == 'release'
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/${{ matrix.asset }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
