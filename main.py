@@ -36,7 +36,9 @@ import websocket  # pip install websocket-client
 # Axes:    0 LeftX, 1 LeftY, 2 LeftTrigger, 3 RightTrigger, 4 RightX, 5 RightY
 # Buttons: A, B, X, Y, LB, RB, Back, Start, L3, R3  (WPILib buttons 1-10)
 # Stick Y follows WPILib: up = -1, down = +1.
-BTN_ORDER = ["A", "B", "X", "Y", "LB", "RB", "Back", "Start", "L3", "R3"]
+# NI (legacy) vs FIRST (gamepad) layouts
+BTN_ORDER_NI = ["A", "B", "X", "Y", "LB", "RB", "Back", "Start", "L3", "R3"]
+BTN_ORDER_FIRST = ["A", "B", "X", "Y", "Back", None, "Start", "L3", "R3", "LB", "RB"]  # None = Guide
 
 # POV encoding. WPILib 2027+: bitmask (up=1, right=2, down=4, left=8; diagonals OR'd,
 # 0 = centered). WPILib 2026 and earlier: angle in degrees, -1 = centered
@@ -94,6 +96,8 @@ BODY = [
 STICK_POS = {"L": (165, 155), "R": (395, 255)}
 RANGE, KNOB = 30, 14  # knob travel (px) and knob radius (px)
 HELD_COLOR = "#ff9800"
+MODE_ID = {"auto": 1, "teleop": 2, "test": 3}  # HAL_RobotMode; "test" = Utility
+DUMP_DS = False
 
 
 class Link:
@@ -124,6 +128,8 @@ class Link:
 
     def _on_message(self, ws, msg):
         self.rx += 1
+        if DUMP_DS and '"DriverStation"' in msg:  # cheap string test before anything else
+            print(msg)
 
     def _on_open(self, ws):
         self.ws, self.connected = ws, True
@@ -142,9 +148,8 @@ class Link:
             axes, buttons, pov, enabled, mode = self.get_state()
             ds = {">new_data": True}  # joystick data is only visible after this
             if self.send_ds:
-                ds.update(
-                    {">ds": True, ">enabled": enabled, ">estop": False, ">autonomous": mode == "auto", ">test": mode == "test"}
-                )
+                if self.send_ds:
+                    ds.update({">ds": True, ">enabled": enabled, ">estop": False, ">robotMode": MODE_ID[mode]})
             try:
                 ws.send(
                     json.dumps(
@@ -171,8 +176,8 @@ class Link:
 
 
 class App:
-    def __init__(self, root, url, joystick, send_ds=True, debug=False, legacy_pov=False):
-        self.root, self.debug, self.legacy_pov = root, debug, legacy_pov
+    def __init__(self, root, url, joystick, send_ds=True, debug=False, legacy_pov=False, ni_layout=False):
+        self.root, self.debug, self.legacy_pov, self.ni_layout = root, debug, legacy_pov, ni_layout
         root.title(f"Sim Xbox Controller (joystick {joystick})")
         self.keys = {c[0]: c[5] for c in CONTROLS}
         self.held = {c[0]: set() for c in CONTROLS}  # who is holding each control
@@ -215,13 +220,15 @@ class App:
 
         self.enabled = tk.BooleanVar(value=False)
         self.mode = tk.StringVar(value="teleop")
+        self.refresh_state()
+
         if send_ds:
             bar = tk.Frame(root)
             bar.pack(fill="x", padx=8, pady=4)
             tk.Checkbutton(
                 bar, text="ENABLE", variable=self.enabled, fg="#c62828", font=("Arial", 10, "bold"), command=self.refresh_state
             ).pack(side="left", padx=(0, 12))
-            for text, val in (("Teleop", "teleop"), ("Auto", "auto"), ("Test", "test")):
+            for text, val in (("Teleop", "teleop"), ("Auto", "auto"), ("Utility", "test")):
                 tk.Radiobutton(bar, text=text, value=val, variable=self.mode, command=self.refresh_state).pack(side="left")
         self.status = tk.Label(root, anchor="w")
         self.status.pack(fill="x", padx=8, pady=(0, 6))
@@ -252,8 +259,13 @@ class App:
         h = lambda n: bool(self.held[n])
         lx, ly = self.sticks["L"]
         rx, ry = self.sticks["R"]
-        axes = [lx, ly, 1.0 if h("LT") else 0.0, 1.0 if h("RT") else 0.0, rx, ry]
-        buttons = [h(n) for n in BTN_ORDER]
+        if self.ni_layout:
+            axes = [lx, ly, 1.0 if h("LT") else 0.0, 1.0 if h("RT") else 0.0, rx, ry]
+            order = BTN_ORDER_NI
+        else:
+            axes = [lx, ly, rx, ry, 1.0 if h("LT") else 0.0, 1.0 if h("RT") else 0.0]
+            order = BTN_ORDER_FIRST
+        buttons = [bool(n and h(n)) for n in order]
         x, y = h("Right") - h("Left"), h("Up") - h("Down")
         if self.legacy_pov:
             pov = POV_ANGLE.get((x, y), -1)
@@ -374,7 +386,10 @@ if __name__ == "__main__":
         "--legacy-pov", action="store_true", help="send POV as angle/-1 (WPILib 2026 and earlier); default is the 2027 bitmask"
     )
     ap.add_argument("--debug", action="store_true", help="print input->socket latency and sim message rate")
+    ap.add_argument("--ni-layout", action="store_true")
+    ap.add_argument("--dump-ds", action="store_true", help="print DriverStation messages from the sim")
     args = ap.parse_args()
+    DUMP_DS = args.dump_ds
     root = tk.Tk()
-    App(root, args.url, args.joystick, send_ds=not args.no_ds, debug=args.debug, legacy_pov=args.legacy_pov)
+    App(root, args.url, args.joystick, send_ds=not args.no_ds, debug=args.debug, legacy_pov=args.legacy_pov, ni_layout=args.ni_layout)
     root.mainloop()
