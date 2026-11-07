@@ -54,6 +54,12 @@ jobs:
         assert tuple(int(x) for x in v.split(".")[:3]) >= (8, 6, 13), f"Tk {v} is too old (need >= 8.6.13)"
         EOF
 
+    - name: Show versions
+      shell: bash
+      run: |
+        python -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.Tcl().eval('info patchlevel'))"
+        pip freeze
+
     - name: Build Standalone Application
       shell: bash
       run: |
